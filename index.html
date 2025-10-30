@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Crypto Portfolio Tracker</title>
-  <meta name="description" content="Tracks BTC, ETH, USDT, DOGE, WRX, SHIB, SXP with Binance USD and WazirX USDT prices, robust retries, and USD→INR conversion.">
+  <meta name="description" content="Tracks BTC, ETH, USDT, DOGE, WRX, SHIB, SXP with Binance USD and WazirX USDT prices, USD→INR cached daily, robust retries.">
   <style>
     :root { color-scheme: light dark; --bg:#0b0c0f; --fg:#e8e9ee; --card:#151821; --muted:#98a2b3; --accent:#3b82f6; --border:#212635; --warn:#f59e0b; }
     * { box-sizing:border-box }
@@ -48,7 +48,7 @@
     <div class="cards">
       <div class="card">
         <div class="row"><div class="label">Total (USD via Binance)</div><div class="total" id="total_usd_binance">$0.00</div></div>
-        <div class="row"><div class="label">USD→INR (FX)</div><div class="value" id="fx_usdinr">—</div></div>
+        <div class="row"><div class="label">USD→INR (daily cached)</div><div class="value" id="fx_usdinr">—</div></div>
         <div class="row"><div class="label">Total (USD via Binance) in INR</div><div class="total" id="total_usd_in_inr">₹0.00</div></div>
         <div class="row"><div class="label">Status</div><div class="label" id="status_binance">OK</div></div>
       </div>
@@ -76,9 +76,10 @@
     <p class="warn" id="warnings"></p>
   </main>
 
-  <footer>Binance spot ticker (USD) and WazirX USDT market (USD-equivalent). Handles 429 with exponential backoff and skips failing sources.</footer>
+  <footer>Binance spot ticker (USD) and WazirX USDT market (USD-equivalent). USD→INR fetched once daily and cached. Handles 429 with exponential backoff and skips failing sources.</footer>
 
 <script>
+/* Holdings */
 const holdings = {
   BTC: 0.00157852,
   ETH: 0.50522559,
@@ -89,9 +90,12 @@ const holdings = {
   SXP: 6.97
 };
 const tracked = Object.keys(holdings);
+
+/* Formatters */
 const nfUSD = new Intl.NumberFormat(undefined, { style:'currency', currency:'USD' });
 const nfINR = new Intl.NumberFormat(undefined, { style:'currency', currency:'INR' });
 
+/* Retry/backoff fetch */
 function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
 async function fetchWithRetry(url, attempts = 3) {
   let lastErr;
@@ -112,6 +116,7 @@ async function fetchWithRetry(url, attempts = 3) {
   throw lastErr || new Error('Request failed');
 }
 
+/* APIs: Binance USD, WazirX USDT */
 function binanceSymbol(a){ return a === 'USDT' ? 'USDTUSDT' : a + 'USDT'; }
 function wazirxSymbolUSDT(a){ return a.toLowerCase() + 'usdt'; }
 
@@ -155,15 +160,40 @@ async function loadWazirXUSDT() {
   return prices;
 }
 
-async function loadFxUSDINR() {
+/* USD→INR fetched once per day with localStorage cache */
+const DAY_MS = 24 * 60 * 60 * 1000;
+function getCachedFx() {
+  const v = localStorage.getItem('fx_usdinr_value');
+  const ts = localStorage.getItem('fx_usdinr_ts');
+  if (!v || !ts) return null;
+  return { value: parseFloat(v), ts: parseInt(ts, 10) };
+}
+function setCachedFx(value) {
+  localStorage.setItem('fx_usdinr_value', String(value));
+  localStorage.setItem('fx_usdinr_ts', String(Date.now()));
+}
+async function fetchFxUSDINRDaily() {
+  const cached = getCachedFx();
+  const now = Date.now();
+  if (cached && now - cached.ts < DAY_MS && isFinite(cached.value)) {
+    return { value: cached.value, fromCache: true };
+  }
   try {
     const fx = await fetchWithRetry('https://www.freeforexapi.com/api/live?pairs=USDINR', 3);
     const rate = fx && fx.rates && fx.rates.USDINR && fx.rates.USDINR.rate;
-    if (rate) return rate;
-  } catch {}
-  return null;
+    if (rate && isFinite(rate)) {
+      setCachedFx(rate);
+      return { value: rate, fromCache: false };
+    }
+    if (cached && isFinite(cached.value)) return { value: cached.value, fromCache: true };
+    throw new Error('FX rate unavailable');
+  } catch (e) {
+    if (cached && isFinite(cached.value)) return { value: cached.value, fromCache: true };
+    throw e;
+  }
 }
 
+/* Render table rows */
 function ensureRows() {
   const tbody = document.getElementById('tbody');
   if (tbody.childElementCount) return;
@@ -181,6 +211,7 @@ function ensureRows() {
   });
 }
 
+/* Main refresh */
 async function refresh() {
   ensureRows();
   const asof = document.getElementById('asof');
@@ -192,14 +223,18 @@ async function refresh() {
   statusWrx.textContent = 'OK';
   asof.textContent = 'Fetching...';
 
-  let binUSD = null, wrxUSDT = null, fxUSDINR = null;
+  let binUSD = null, wrxUSDT = null, fxUSDINR = null, fxFromCache = false;
 
   await Promise.all([
     (async ()=>{ try { binUSD = await loadBinanceUSD(); } catch(e){ statusBin.textContent='Unavailable'; warnings.textContent += `[Binance] ${e.message}. `; } })(),
     (async ()=>{ try { wrxUSDT = await loadWazirXUSDT(); } catch(e){ statusWrx.textContent='Unavailable'; warnings.textContent += `[WazirX] ${e.message}. `; if((e.message||'').includes('429')) warnings.textContent += `Rate limited; skipping WazirX USDT. `; } })(),
-    (async ()=>{ try { fxUSDINR = await loadFxUSDINR(); if (fxUSDINR) document.getElementById('fx_usdinr').textContent = nfINR.format(fxUSDINR); } catch(e){ warnings.textContent += `[FX] ${e.message}. `; } })()
+    (async ()=>{ try { const fx = await fetchFxUSDINRDaily(); fxUSDINR = fx.value; fxFromCache = fx.fromCache; } catch(e){ warnings.textContent += `[FX] ${e.message}. `; } })()
   ]);
 
+  // Display FX
+  document.getElementById('fx_usdinr').textContent = fxUSDINR ? nfINR.format(fxUSDINR) + (fxFromCache ? ' (cached)' : '') : '—';
+
+  // Update per-asset rows and totals
   let totalBinUSD = 0, totalWrxUSD = 0;
 
   for (const a of tracked) {
@@ -228,6 +263,7 @@ async function refresh() {
     }
   }
 
+  // Totals and conversion
   document.getElementById('total_usd_binance').textContent = nfUSD.format(totalBinUSD);
   document.getElementById('total_usd_wazirx').textContent = totalWrxUSD ? nfUSD.format(totalWrxUSD) : '—';
   document.getElementById('total_usd_in_inr').textContent = fxUSDINR ? nfINR.format(totalBinUSD * fxUSDINR) : '—';
@@ -235,6 +271,7 @@ async function refresh() {
   asof.textContent = new Date().toLocaleString();
 }
 
+/* Interactions */
 document.getElementById('refresh').addEventListener('click', refresh);
 let autoTimer = null;
 document.getElementById('auto').addEventListener('click', (e)=>{
@@ -242,6 +279,7 @@ document.getElementById('auto').addEventListener('click', (e)=>{
   else { autoTimer=setInterval(refresh, 30000); e.target.textContent='Auto: 30s'; refresh(); }
 });
 
+/* First load */
 refresh();
 </script>
 </body>
