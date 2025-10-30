@@ -76,7 +76,7 @@
     <p class="warn" id="warnings"></p>
   </main>
 
-  <footer>Binance spot ticker (USD) and WazirX USDT market (USD-equivalent). USD→INR fetched once daily and cached. Handles 429 with exponential backoff and skips failing sources.</footer>
+  <footer>WazirX bulk tickers endpoint used for all pairs; Binance used for USD; USD→INR fetched daily and cached; 429/backoff and skip logic included.</footer>
 
 <script>
 /* Holdings */
@@ -116,9 +116,8 @@ async function fetchWithRetry(url, attempts = 3) {
   throw lastErr || new Error('Request failed');
 }
 
-/* APIs: Binance USD, WazirX USDT */
+/* APIs: Binance USD, WazirX bulk USDT */
 function binanceSymbol(a){ return a === 'USDT' ? 'USDTUSDT' : a + 'USDT'; }
-function wazirxSymbolUSDT(a){ return a.toLowerCase() + 'usdt'; }
 
 async function loadBinanceUSD() {
   const prices = {};
@@ -140,24 +139,22 @@ async function loadBinanceUSD() {
   return prices;
 }
 
-async function loadWazirXUSDT() {
-  const prices = {};
-  const tasks = tracked.map(a =>
-    fetchWithRetry(`https://api.wazirx.com/sapi/v1/ticker/24hr?symbol=${wazirxSymbolUSDT(a)}`, 3)
-      .then(j => ({ a, j })).catch(() => null)
-  );
-  const res = await Promise.all(tasks);
-  res.forEach(r => {
-    if (!r) return;
-    if (r.a === 'USDT') { prices.USDT = 1; return; }
-    if (r.j && (r.j.lastPrice || r.j.last)) {
-      const lp = r.j.lastPrice || r.j.last;
-      const num = parseFloat(lp);
-      if (!Number.isNaN(num)) prices[r.a] = num;
-    }
-  });
-  if (tracked.includes('USDT') && !prices.USDT) prices.USDT = 1;
-  return prices;
+// WazirX bulk: GET /sapi/v1/tickers/24hr returns an array of tickers; build a map for our USDT symbols
+async function loadWazirXUSDTBulk() {
+  const resp = await fetchWithRetry('https://api.wazirx.com/sapi/v1/tickers/24hr', 3);
+  if (!Array.isArray(resp)) throw new Error('Unexpected WazirX response');
+  const needed = new Set(tracked.map(a => a.toLowerCase() + 'usdt'));
+  const map = {};
+  for (const t of resp) {
+    // Expect fields: symbol, baseAsset, quoteAsset, lastPrice, etc.
+    const sym = (t.symbol || '').toLowerCase();
+    if (!needed.has(sym)) continue;
+    const base = (t.baseAsset || '').toUpperCase();
+    const lp = parseFloat(t.lastPrice);
+    if (Number.isFinite(lp)) map[base] = lp;
+  }
+  if (tracked.includes('USDT') && map.USDT == null) map.USDT = 1;
+  return map;
 }
 
 /* USD→INR fetched once per day with localStorage cache */
@@ -227,7 +224,7 @@ async function refresh() {
 
   await Promise.all([
     (async ()=>{ try { binUSD = await loadBinanceUSD(); } catch(e){ statusBin.textContent='Unavailable'; warnings.textContent += `[Binance] ${e.message}. `; } })(),
-    (async ()=>{ try { wrxUSDT = await loadWazirXUSDT(); } catch(e){ statusWrx.textContent='Unavailable'; warnings.textContent += `[WazirX] ${e.message}. `; if((e.message||'').includes('429')) warnings.textContent += `Rate limited; skipping WazirX USDT. `; } })(),
+    (async ()=>{ try { wrxUSDT = await loadWazirXUSDTBulk(); } catch(e){ statusWrx.textContent='Unavailable'; warnings.textContent += `[WazirX] ${e.message}. `; if((e.message||'').includes('429')) warnings.textContent += `Rate limited; skipping WazirX. `; } })(),
     (async ()=>{ try { const fx = await fetchFxUSDINRDaily(); fxUSDINR = fx.value; fxFromCache = fx.fromCache; } catch(e){ warnings.textContent += `[FX] ${e.message}. `; } })()
   ]);
 
