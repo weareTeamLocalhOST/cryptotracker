@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Crypto Portfolio</title>
+  <style>
+    :root { color-scheme: light dark; --bg:#0b0b0c; --fg:#e9e9ea; --card:#151518; --green:#18c37e; --red:#ff5a6e; --muted:#9aa0a6; }
+    body { margin:0; font-family:system-ui,Segoe UI,Roboto,Inter,Arial; background:var(--bg); color:var(--fg); }
+    header { padding:16px; text-align:center; }
+    .container { max-width:920px; margin:0 auto; padding:16px; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:12px; }
+    .card { background:var(--card); border-radius:12px; padding:14px 16px; }
+    .row { display:flex; align-items:center; justify-content:space-between; margin:6px 0; }
+    .label { color:var(--muted); font-size:13px; }
+    .value { font-weight:600; }
+    .total { font-size:22px; font-weight:700; }
+    footer { font-size:12px; color:var(--muted); text-align:center; padding:16px; }
+    button { background:#202127; color:var(--fg); border:1px solid #2b2c33; border-radius:8px; padding:8px 12px; cursor:pointer; }
+    .row.wrap { flex-wrap:wrap; gap:8px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Crypto Portfolio</h1>
+    <div class="row wrap">
+      <div class="label">Base currency:</div>
+      <button id="baseUSD">USD</button>
+      <button id="baseINR">INR</button>
+      <button id="refresh">Refresh</button>
+      <div class="label" id="asof"></div>
+    </div>
+  </header>
+
+  <div class="container">
+    <div class="card">
+      <div class="row">
+        <div class="label">Total Value</div>
+        <div class="total" id="total">$0.00</div>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card" id="btc">
+        <div class="row"><div class="value">BTC</div><div class="value" id="btc_price">$0</div></div>
+        <div class="row"><div class="label">Qty</div><div class="value">0.000005</div></div>
+        <div class="row"><div class="label">Value</div><div class="value" id="btc_value">$0</div></div>
+      </div>
+
+      <div class="card" id="eth">
+        <div class="row"><div class="value">ETH</div><div class="value" id="eth_price">$0</div></div>
+        <div class="row"><div class="label">Qty</div><div class="value">0.25</div></div>
+        <div class="row"><div class="label">Value</div><div class="value" id="eth_value">$0</div></div>
+      </div>
+
+      <div class="card" id="wrx">
+        <div class="row"><div class="value">WRX</div><div class="value" id="wrx_price">$0</div></div>
+        <div class="row"><div class="label">Qty</div><div class="value">23</div></div>
+        <div class="row"><div class="label">Value</div><div class="value" id="wrx_value">$0</div></div>
+      </div>
+    </div>
+  </div>
+
+  <footer>Data: Binance Spot public endpoints; WazirX 24h ticker. CoinMarketCap requires a server proxy; not used in this static build.</footer>
+
+<script>
+const holdings = { BTC: 0.000005, ETH: 0.25, WRX: 23 };
+let base = localStorage.getItem('base') || 'USD';
+
+const $ = sel => document.querySelector(sel);
+const fmt = (n, curr) => new Intl.NumberFormat(undefined, { style:'currency', currency: curr }).format(n);
+
+async function fetchJSON(url) {
+  const r = await fetch(url, { cache: 'no-store' });
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+  return r.json();
+}
+
+// Sources:
+// - Binance market data base: https://data-api.binance.vision for public endpoints
+// - WazirX public: https://api.wazirx.com/sapi/v1/ticker/24hr?symbol=wrxinr
+async function getPricesUSD() {
+  // BTC, ETH from Binance (USDT ~ USD)
+  const [btc, eth] = await Promise.all([
+    fetchJSON('https://data-api.binance.vision/api/v3/ticker/price?symbol=BTCUSDT'),
+    fetchJSON('https://data-api.binance.vision/api/v3/ticker/price?symbol=ETHUSDT'),
+  ]);
+  // WRX: try Binance WRXUSDT; if not available, convert from INR using WazirX wrxinr and usdtinr
+  let wrxUSD = null;
+  try {
+    const wrx = await fetchJSON('https://data-api.binance.vision/api/v3/ticker/price?symbol=WRXUSDT');
+    wrxUSD = parseFloat(wrx.price);
+  } catch {
+    const [wrxINR, usdtINR] = await Promise.all([
+      fetchJSON('https://api.wazirx.com/sapi/v1/ticker/24hr?symbol=wrxinr'),
+      fetchJSON('https://api.wazirx.com/sapi/v1/ticker/24hr?symbol=usdtinr'),
+    ]);
+    wrxUSD = parseFloat(wrxINR.lastPrice) / parseFloat(usdtINR.lastPrice);
+  }
+  return {
+    USD: 1,
+    BTC: parseFloat(btc.price),
+    ETH: parseFloat(eth.price),
+    WRX: wrxUSD,
+  };
+}
+
+async function getPricesINR() {
+  const [btc, eth, wrx] = await Promise.all([
+    fetchJSON('https://api.wazirx.com/sapi/v1/ticker/24hr?symbol=btcinr'),
+    fetchJSON('https://api.wazirx.com/sapi/v1/ticker/24hr?symbol=ethinr'),
+    fetchJSON('https://api.wazirx.com/sapi/v1/ticker/24hr?symbol=wrxinr'),
+  ]);
+  return {
+    INR: 1,
+    BTC: parseFloat(btc.lastPrice),
+    ETH: parseFloat(eth.lastPrice),
+    WRX: parseFloat(wrx.lastPrice),
+  };
+}
+
+async function refresh() {
+  $('#total').textContent = '...';
+  $('#asof').textContent = 'Fetching...';
+  try {
+    const rates = base === 'USD' ? await getPricesUSD() : await getPricesINR();
+    const curr = base;
+    const sym = curr === 'USD' ? 'USD' : 'INR';
+
+    const btcPrice = rates.BTC;
+    const ethPrice = rates.ETH;
+    const wrxPrice = rates.WRX;
+
+    $('#btc_price').textContent = fmt(btcPrice, sym);
+    $('#eth_price').textContent = fmt(ethPrice, sym);
+    $('#wrx_price').textContent = fmt(wrxPrice, sym);
+
+    const btcVal = btcPrice * holdings.BTC;
+    const ethVal = ethPrice * holdings.ETH;
+    const wrxVal = wrxPrice * holdings.WRX;
+
+    $('#btc_value').textContent = fmt(btcVal, sym);
+    $('#eth_value').textContent = fmt(ethVal, sym);
+    $('#wrx_value').textContent = fmt(wrxVal, sym);
+
+    const total = btcVal + ethVal + wrxVal;
+    $('#total').textContent = fmt(total, sym);
+    $('#asof').textContent = new Date().toLocaleString();
+  } catch (e) {
+    $('#total').textContent = 'Error';
+    $('#asof').textContent = e.message;
+  }
+}
+
+$('#baseUSD').onclick = () => { base = 'USD'; localStorage.setItem('base','USD'); refresh(); };
+$('#baseINR').onclick = () => { base = 'INR'; localStorage.setItem('base','INR'); refresh(); };
+$('#refresh').onclick = refresh;
+
+refresh();
+</script>
+</body>
+</html>
