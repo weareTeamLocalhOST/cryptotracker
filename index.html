@@ -4,9 +4,8 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Crypto Portfolio Tracker</title>
-  <meta name="description" content="Single-page crypto portfolio tracker showing Binance (USD) and WazirX (INR) prices and totals.">
   <style>
-    :root { color-scheme: light dark; --bg:#0b0c0f; --fg:#e8e9ee; --card:#151821; --muted:#98a2b3; --accent:#3b82f6; --border:#212635; }
+    :root { color-scheme: light dark; --bg:#0b0c0f; --fg:#e8e9ee; --card:#151821; --muted:#98a2b3; --accent:#3b82f6; --border:#212635; --warn:#f59e0b; }
     * { box-sizing:border-box }
     body { margin:0; font-family: Inter, ui-sans-serif, system-ui, Segoe UI, Roboto, Arial; background:var(--bg); color:var(--fg); }
     header { padding:16px; border-bottom:1px solid var(--border); position:sticky; top:0; backdrop-filter:saturate(160%) blur(6px); background: color-mix(in oklab, var(--bg) 85%, transparent); }
@@ -21,6 +20,7 @@
     .label { color:var(--muted); font-size:13px; }
     .value { font-weight:600; }
     .total { font-size:22px; font-weight:800; }
+    .warn { color: var(--warn); font-size:12px; }
     table { width:100%; border-collapse:collapse; margin-top:12px; }
     th, td { padding:10px 8px; border-bottom:1px solid var(--border); }
     th { text-align:left; color:var(--muted); font-weight:600; }
@@ -28,7 +28,6 @@
     footer { font-size:12px; color:var(--muted); text-align:center; padding:16px; }
     .asof { margin-left:auto; font-size:12px; color:var(--muted); }
     .pill { font-size:12px; padding:4px 8px; border-radius:999px; border:1px solid var(--border); }
-    @media (max-width:520px){ .total { font-size:18px } }
   </style>
 </head>
 <body>
@@ -48,11 +47,11 @@
     <div class="cards">
       <div class="card">
         <div class="row"><div class="label">Total (USD from Binance)</div><div class="total" id="total_usd">$0.00</div></div>
-        <div class="row"><div class="label">Per-asset breakdown below</div><div class="label">BTC 0.000005 · ETH 0.25 · WRX 23</div></div>
+        <div class="row"><div class="label">BTC 0.000005 · ETH 0.25 · WRX 23</div><div class="label" id="status_binance">OK</div></div>
       </div>
       <div class="card">
         <div class="row"><div class="label">Total (INR from WazirX)</div><div class="total" id="total_inr">₹0.00</div></div>
-        <div class="row"><div class="label">Converted locally, no keys</div><div class="label">Binance + WazirX</div></div>
+        <div class="row"><div class="label">Locally computed</div><div class="label" id="status_wazirx">OK</div></div>
       </div>
     </div>
 
@@ -94,37 +93,63 @@
         </tr>
       </tbody>
     </table>
+
+    <p class="warn" id="warnings"></p>
   </main>
 
-  <footer>
-    Data sources: Binance public price ticker (USD) and WazirX public 24h ticker (INR). No API keys required. Deploy on GitHub Pages by committing this file and enabling Pages in repository settings.
-  </footer>
+  <footer>Handles 429 with backoff and skips failing sources. Data: Binance price ticker and WazirX 24h ticker. </footer>
 
 <script>
 const qty = { BTC: 0.000005, ETH: 0.25, WRX: 23 };
 const nfUSD = new Intl.NumberFormat(undefined, { style:'currency', currency:'USD' });
 const nfINR = new Intl.NumberFormat(undefined, { style:'currency', currency:'INR' });
 
-async function j(url){
-  const r = await fetch(url, { cache:'no-store' });
-  if(!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-  return r.json();
+function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
+
+// Retry on 429/5xx, honor Retry-After, cap attempts
+async function fetchWithRetry(url, opts = {}, attempts = 3) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const res = await fetch(url, { cache:'no-store', ...opts });
+      if (res.status === 429) {
+        const retryAfter = parseInt(res.headers.get('Retry-After') || '0', 10);
+        const delay = retryAfter > 0 ? (retryAfter * 1000) : (200 * Math.pow(2, i));
+        await sleep(delay);
+        continue;
+      }
+      if (res.status >= 500 && res.status < 600) {
+        await sleep(200 * Math.pow(2, i));
+        continue;
+      }
+      if (!res.ok) {
+        // Non-retryable 4xx
+        throw new Error(`${res.status} ${res.statusText}`);
+      }
+      return await res.json();
+    } catch (err) {
+      lastErr = err;
+      // Network error; retry with backoff
+      await sleep(200 * Math.pow(2, i));
+    }
+  }
+  throw lastErr || new Error('Request failed');
 }
 
-// Binance USD prices (USDT as USD proxy). Try WRXUSDT; if unavailable, derive from WazirX INR via USDTINR.
+// Binance USD prices; WRX via WRXUSDT if available, else derive from WazirX INR/USDTINR
 async function loadBinanceUSD() {
   const [btc, eth] = await Promise.all([
-    j('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT'),
-    j('https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT'),
+    fetchWithRetry('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT'),
+    fetchWithRetry('https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT'),
   ]);
   let wrxUSD;
   try {
-    const wrx = await j('https://api.binance.com/api/v3/ticker/price?symbol=WRXUSDT');
+    const wrx = await fetchWithRetry('https://api.binance.com/api/v3/ticker/price?symbol=WRXUSDT');
     wrxUSD = parseFloat(wrx.price);
   } catch {
     const [wrxINR, usdtINR] = await Promise.all([
-      j('https://api.wazirx.com/sapi/v1/ticker/24hr?symbol=wrxinr'),
-      j('https://api.wazirx.com/sapi/v1/ticker/24hr?symbol=usdtinr'),
+      fetchWithRetry('https://api.wazirx.com/sapi/v1/ticker/24hr?symbol=wrxinr'),
+      fetchWithRetry('https://api.wazirx.com/sapi/v1/ticker/24hr?symbol=usdtinr'),
     ]);
     wrxUSD = parseFloat(wrxINR.lastPrice) / parseFloat(usdtINR.lastPrice);
   }
@@ -135,12 +160,12 @@ async function loadBinanceUSD() {
   };
 }
 
-// WazirX INR prices
+// WazirX INR prices with retry/backoff; if fails, caller will skip INR block
 async function loadWazirXINR() {
   const [btc, eth, wrx] = await Promise.all([
-    j('https://api.wazirx.com/sapi/v1/ticker/24hr?symbol=btcinr'),
-    j('https://api.wazirx.com/sapi/v1/ticker/24hr?symbol=ethinr'),
-    j('https://api.wazirx.com/sapi/v1/ticker/24hr?symbol=wrxinr'),
+    fetchWithRetry('https://api.wazirx.com/sapi/v1/ticker/24hr?symbol=btcinr'),
+    fetchWithRetry('https://api.wazirx.com/sapi/v1/ticker/24hr?symbol=ethinr'),
+    fetchWithRetry('https://api.wazirx.com/sapi/v1/ticker/24hr?symbol=wrxinr'),
   ]);
   return {
     BTC: parseFloat(btc.lastPrice),
@@ -151,52 +176,78 @@ async function loadWazirXINR() {
 
 async function refresh() {
   const asof = document.getElementById('asof');
+  const warnings = document.getElementById('warnings');
+  const statusBin = document.getElementById('status_binance');
+  const statusWrx = document.getElementById('status_wazirx');
+  warnings.textContent = '';
+  statusBin.textContent = 'OK';
+  statusWrx.textContent = 'OK';
   asof.textContent = 'Fetching...';
-  try {
-    const [pxUSD, pxINR] = await Promise.all([loadBinanceUSD(), loadWazirXINR()]);
 
-    // Per-coin values in USD
+  // Reset cells
+  const ids = ['btc_px_usd','eth_px_usd','wrx_px_usd','btc_val_usd','eth_val_usd','wrx_val_usd',
+               'btc_px_inr','eth_px_inr','wrx_px_inr','btc_val_inr','eth_val_inr','wrx_val_inr'];
+  ids.forEach(id => document.getElementById(id).textContent = '—');
+
+  let pxUSD = null, pxINR = null;
+  // Load both sources independently with guarded errors
+  try {
+    pxUSD = await loadBinanceUSD();
+  } catch (e) {
+    statusBin.textContent = `Unavailable`;
+    warnings.textContent += `[Binance] ${e.message}. `;
+  }
+
+  try {
+    pxINR = await loadWazirXINR();
+  } catch (e) {
+    statusWrx.textContent = `Unavailable`;
+    warnings.textContent += `[WazirX] ${e.message}. `;
+    // If the message included 429, hint to slow down
+    if ((e.message||'').includes('429')) {
+      warnings.textContent += `Rate limited; backing off as per Retry-After headers. `;
+    }
+  }
+
+  // Update USD side if available
+  if (pxUSD) {
     const usdVals = {
       BTC: pxUSD.BTC * qty.BTC,
       ETH: pxUSD.ETH * qty.ETH,
       WRX: pxUSD.WRX * qty.WRX
     };
-    // Per-coin values in INR
+    document.getElementById('btc_px_usd').textContent = nfUSD.format(pxUSD.BTC);
+    document.getElementById('eth_px_usd').textContent = nfUSD.format(pxUSD.ETH);
+    document.getElementById('wrx_px_usd').textContent = nfUSD.format(pxUSD.WRX);
+    document.getElementById('btc_val_usd').textContent = nfUSD.format(usdVals.BTC);
+    document.getElementById('eth_val_usd').textContent = nfUSD.format(usdVals.ETH);
+    document.getElementById('wrx_val_usd').textContent = nfUSD.format(usdVals.WRX);
+    const totalUSD = usdVals.BTC + usdVals.ETH + usdVals.WRX;
+    document.getElementById('total_usd').textContent = nfUSD.format(totalUSD);
+  } else {
+    document.getElementById('total_usd').textContent = '—';
+  }
+
+  // Update INR side if available
+  if (pxINR) {
     const inrVals = {
       BTC: pxINR.BTC * qty.BTC,
       ETH: pxINR.ETH * qty.ETH,
       WRX: pxINR.WRX * qty.WRX
     };
-
-    // Update price cells
-    document.getElementById('btc_px_usd').textContent = nfUSD.format(pxUSD.BTC);
-    document.getElementById('eth_px_usd').textContent = nfUSD.format(pxUSD.ETH);
-    document.getElementById('wrx_px_usd').textContent = nfUSD.format(pxUSD.WRX);
-
     document.getElementById('btc_px_inr').textContent = nfINR.format(pxINR.BTC);
     document.getElementById('eth_px_inr').textContent = nfINR.format(pxINR.ETH);
     document.getElementById('wrx_px_inr').textContent = nfINR.format(pxINR.WRX);
-
-    // Update value cells
-    document.getElementById('btc_val_usd').textContent = nfUSD.format(usdVals.BTC);
-    document.getElementById('eth_val_usd').textContent = nfUSD.format(usdVals.ETH);
-    document.getElementById('wrx_val_usd').textContent = nfUSD.format(usdVals.WRX);
-
     document.getElementById('btc_val_inr').textContent = nfINR.format(inrVals.BTC);
     document.getElementById('eth_val_inr').textContent = nfINR.format(inrVals.ETH);
     document.getElementById('wrx_val_inr').textContent = nfINR.format(inrVals.WRX);
-
-    // Totals
-    const totalUSD = usdVals.BTC + usdVals.ETH + usdVals.WRX;
     const totalINR = inrVals.BTC + inrVals.ETH + inrVals.WRX;
-
-    document.getElementById('total_usd').textContent = nfUSD.format(totalUSD);
     document.getElementById('total_inr').textContent = nfINR.format(totalINR);
-
-    asof.textContent = new Date().toLocaleString();
-  } catch (e) {
-    asof.textContent = `Error: ${e.message}`;
+  } else {
+    document.getElementById('total_inr').textContent = '—';
   }
+
+  asof.textContent = new Date().toLocaleString();
 }
 
 document.getElementById('refresh').addEventListener('click', refresh);
@@ -207,13 +258,13 @@ document.getElementById('auto').addEventListener('click', (e)=>{
     autoTimer = null;
     e.target.textContent = 'Auto: Off';
   } else {
-    autoTimer = setInterval(refresh, 15000);
-    e.target.textContent = 'Auto: 15s';
+    // Slow down to be kind to public APIs; align with rate-limit guidance
+    autoTimer = setInterval(refresh, 30000);
+    e.target.textContent = 'Auto: 30s';
     refresh();
   }
 });
 
-// Initial load
 refresh();
 </script>
 </body>
